@@ -22,7 +22,7 @@ void print_help(const char* prog_name) {
               << "将三维点云投影到 XOZ 平面，生成 2D 栅格地图。\n\n"
               << "选项:\n"
               << "  -r <float>     栅格分辨率 (米/像素, 默认: 0.05)\n"
-              << "  -s <1|2|3>     地面检测方法: 1=RANSAC, 2=MLESAC, 3=MSAC (默认: 1)\n"
+              << "  -m <1|2|3>     地面检测方法: 1=RANSAC, 2=MLESAC, 3=MSAC (默认: 1)\n"
               << "  -g <float>      地面检测距离阈值 (米, 默认: 0.05)\n"
               << "  -min <float>    保留点的最小相对高度 (米, 默认: 0.2)\n"
               << "  -max <float>    保留点的最大相对高度 (米, 默认: 2.0)\n"
@@ -32,64 +32,78 @@ void print_help(const char* prog_name) {
 }
 
 // 地面平面检测 
-void planar_segmentation(const PointCloud::Ptr& cloud, int select, double g, int m,
-                         Eigen::Vector4d& coefficients) {
+void planar(const PointCloud::Ptr& cloud,
+                   int m,
+                   double g,
+                   Eigen::Vector4d& coefficients) {
+    // 降采样加速
     pcl::VoxelGrid<PointType> voxel_filter;
-    PointCloud::Ptr downcloud(new PointCloud);
+    PointCloud::Ptr fastcloud(new PointCloud);
     voxel_filter.setInputCloud(cloud);
     voxel_filter.setLeafSize(0.1f, 0.1f, 0.1f);
-    voxel_filter.filter(*downcloud);
-
+    voxel_filter.filter(*fastcloud);
+    // 创建分割对象
     pcl::SACSegmentation<PointType> seg;
     seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PLANE);
-
-    switch (select) {
-        case 1: seg.setMethodType(pcl::SAC_RANSAC);  break;
-        case 2: seg.setMethodType(pcl::SAC_MLESAC);  break;
-        case 3: seg.setMethodType(pcl::SAC_MSAC);    break;
-        default: seg.setMethodType(pcl::SAC_RANSAC); break;
+    seg.setModelType(pcl::SACMODEL_PLANE);  // 指定平面模型
+    switch(m) {
+        case 1:
+            seg.setMethodType(pcl::SAC_RANSAC);
+            std::cout << "  使用 RANSAC 方法" << std::endl;
+            break;
+        case 2:
+            seg.setMethodType(pcl::SAC_MLESAC);
+            std::cout << "  使用 MLESAC 方法" << std::endl;
+            break;
+        case 3:
+            seg.setMethodType(pcl::SAC_MSAC);
+            std::cout << "  使用 MSAC 方法" << std::endl;
+            break;
     }
-    std::cout << "  地面检测方法: " << (select == 2 ? "MLESAC" : (select == 3 ? "MSAC" : "RANSAC")) << std::endl;
-
-    seg.setDistanceThreshold(g);
-    seg.setMaxIterations(m);
+    seg.setDistanceThreshold(g);  // 设置点到平面的距离阈值
+    seg.setMaxIterations(500);  // 设置最大迭代次数
+    seg.setProbability(0.99);  // 设置置信度
     pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
     pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-    seg.setInputCloud(downcloud);
-    seg.segment(*inliers, *coeff);
-
-    coefficients << coeff->values[0], coeff->values[1], coeff->values[2], coeff->values[3];
+    seg.setInputCloud(fastcloud);
+    seg.segment(*inliers, *coeff);  // 执行分割，将内点索引存入 inliers，平面系数（a,b,c,d）存入 coefficients
+    coefficients << coeff->values[0], coeff->values[1], coeff->values[2], coeff->values[3];  // 提取系数
 }
 
 // 计算点到平面的有向距离
-double h(const PointType& point, const Eigen::Vector4d& coeff) {
-    double a = coeff[0], b = coeff[1], c = coeff[2], d = coeff[3];
-    double denom = sqrt(a*a + b*b + c*c);
-    if (denom < 1e-6) return 0.0;
-    return (a*point.x + b*point.y + c*point.z + d) / denom;
+double h(const PointType& point,
+                     const Eigen::Vector4d& plane) {
+    double a = plane[0], b = plane[1], c = plane[2], d = plane[3];
+    double m = std::sqrt(a*a + b*b + c*c);
+    if (m < 1e-6){
+        return 0.0;  // 防止除数过小
+    }
+    return (a*point.x + b*point.y + c*point.z + d) / m;
 }
 
 int main(int argc, char** argv) {
+    // 解析命令行参数
     if (argc < 2) {
         print_help(argv[0]);
         return -1;
     }
 
     std::string input_pcd;
-    double r = 0.05;       // 栅格分辨率
-    int s = 1;             // 地面检测方法
+    double r = 0.05;       // 栅格分辨率 (m/pixel)
+    int m = 1;             // 地面检测方法
     double g = 0.05;       // 地面检测距离阈值
-    double min_h = 0.2;    // 最小相对高度
-    double max_h = 2.0;    // 最大相对高度
+    double hMin = 0.2;    // 最小相对高度
+    double hMax = 2.0;    // 最大相对高度
     double o = 0.2;        // 障碍物阈值比例
 
     int arg_idx = 1;
+    // 检查第一个参数是否为帮助
     std::string first_arg = argv[1];
     if (first_arg == "-h" || first_arg == "--help") {
         print_help(argv[0]);
         return 0;
     }
+    // 第一个参数是输入 PCD 文件
     input_pcd = argv[1];
     arg_idx = 2;
 
@@ -98,33 +112,43 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "-r" && i + 1 < argc) {
             r = atof(argv[++i]);
-            if (r <= 0) {
-                std::cerr << "错误: 分辨率必须大于0\n";
-                return -1;
-            }
-        } else if (arg == "-s" && i + 1 < argc) {
-            s = atoi(argv[++i]);
-            if (s < 1 || s > 3) {
-                std::cerr << "错误: -s 必须为 1,2 或 3\n";
-                return -1;
-            }
+        } else if (arg == "-m" && i + 1 < argc) {
+            m = atoi(argv[++i]);
         } else if (arg == "-g" && i + 1 < argc) {
             g = atof(argv[++i]);
         } else if (arg == "-min" && i + 1 < argc) {
-            min_h = atof(argv[++i]);
+            hMin = atof(argv[++i]);
         } else if (arg == "-max" && i + 1 < argc) {
-            max_h = atof(argv[++i]);
-            if (min_h >= max_h) {
-                std::cerr << "错误: 最大高度必须大于最小高度\n";
-                return -1;
-            }
+            hMax = atof(argv[++i]);
         } else if (arg == "-o" && i + 1 < argc) {
             o = atof(argv[++i]);
         } else {
             std::cerr << "警告: 未知参数 " << arg << std::endl;
         }
     }
-
+    
+    // 参数有效性检查
+    if (r <= 0.0) {
+        std::cerr << "错误：分辨率必须大于0" << std::endl;
+        return -1;
+    }
+    if (o < 0.0 || o > 1.0) {
+        std::cerr << "错误：障碍物比例必须在 [0,1] 之间" << std::endl;
+        return -1;
+    }
+    if (g <= 0.0) {
+        std::cerr << "错误：地面检测距离阈值必须大于0" << std::endl;
+        return -1;
+    }
+    if (hMin >= hMax) {
+        std::cerr << "错误：最小高度必须小于最大高度" << std::endl;
+        return -1;
+    }
+    if (m < 1 || m > 3) {
+        std::cerr << "错误: -s 必须为 1,2 或 3\n";
+        return -1;
+    }
+    
     auto start = std::chrono::high_resolution_clock::now();
 
     std::cout << "\n========== [1/4] 加载点云 ==========" << std::endl;
@@ -137,7 +161,7 @@ int main(int argc, char** argv) {
 
     std::cout << "\n========== [2/4] 地面检测与高度过滤 ==========" << std::endl;
     Eigen::Vector4d ground;
-    planar_segmentation(cloud, s, g, 1000, ground);
+    planar(cloud, m, g, ground);
     std::cout << "  平面方程: " << ground[0] << "x + " << ground[1] << "y + "
               << ground[2] << "z + " << ground[3] << " = 0" << std::endl;
 
@@ -151,7 +175,7 @@ int main(int argc, char** argv) {
     for (const auto& point : cloud->points) {
         if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
         double height = h(point, ground);
-        if (height >= min_h && height <= max_h) {
+        if (height >= hMin && height <= hMax) {
             filter.push_back(point);
             if (point.x < min_x) min_x = point.x;
             if (point.x > max_x) max_x = point.x;
@@ -159,7 +183,7 @@ int main(int argc, char** argv) {
             if (point.z > max_z) max_z = point.z;
         }
     }
-    std::cout << "  相对高度范围: [" << min_h << ", " << max_h << "] 米\n";
+    std::cout << "  相对高度范围: [" << hMin << ", " << hMax << "] 米\n";
     std::cout << "  过滤后点数: " << filter.size() << " / " << cloud->size() << std::endl;
 
     // 边界裕量
@@ -209,6 +233,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "\n========== [4/4] 保存地图文件 ==========" << std::endl;
+
     // 保存 PGM
     std::string pgm_file = "gridmap.pgm";
     std::ofstream pgm(pgm_file, std::ios::binary);
@@ -255,7 +280,7 @@ int main(int argc, char** argv) {
     std::cout << "  保存 YAML: " << yaml_file << std::endl;
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto time = std::chrono::duration_cast<std::chrono::milliseconds>(end- start).count();
+    auto time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
     std::cout << "\n========== 栅格地图信息 ==========" << std::endl;
     std::cout << "  地图尺寸: " << W << " x " << H << " 像素" << std::endl;
